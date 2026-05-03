@@ -318,7 +318,6 @@ func (p *ScreenCastPortal) parseStreams(results map[string]dbus.Variant) (uint32
 }
 
 // ─── Recording ────────────────────────────────────────────────────────────
-
 func startRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
 	file := os.NewFile(uintptr(pwFd), "pipewire")
 
@@ -326,79 +325,47 @@ func startRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
 		output = output + ".mkv"
 	}
 
-	// cmd := exec.Command(
-	// 	"gst-launch-1.0",
-	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
-	// 	"!", "videoconvert",
-	// 	"!", "x264enc", "bitrate=5000", "speed-preset=ultrafast", "key-int-max=30",
-	// 	"!", "matroskamux",
-	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
-	// )
+	cmd := exec.Command(
+		"gst-launch-1.0",
+		"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+		"!", "videoconvert",
+		"!", "videoscale", "!", "video/x-raw, format=I420", // ensure proper colorspace
+		"!", "x264enc",
+		"bitrate=20000",       // 20 Mbps — adjust based on resolution
+		"speed-preset=medium", // balance of speed/quality
+		"tune=zerolatency",    // better for screen content
+		"key-int-max=60",      // less frequent keyframes, better compression
+		"vbv-buf-capacity=0",  // let encoder manage buffering
+		"ref=4",               // more reference frames for quality
+		"!", "matroskamux",
+		"!", "filesink", fmt.Sprintf("location=%s", output),
+	)
 
-	// cmd := exec.Command(
-	// 	"gst-launch-1.0",
-	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
-	// 	"!", "videoconvert",
-	// 	"!", "video/x-raw,framerate=30/1",
-	// 	"!", "x264enc",
-	// 	"tune=zerolatency",
-	// 	"speed-preset=veryfast",
-	// 	"crf=18",
-	// 	"key-int-max=60",
-	// 	"!", "matroskamux",
-	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
-	// )
+	cmd.ExtraFiles = []*os.File{file}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	// cmd := exec.Command(
-	// 	"gst-launch-1.0",
-	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
-	// 	"!", "videoconvert",
-	// 	"!", "videoscale",
-	// 	"!", "video/x-raw,width=1920,height=1080,framerate=30/1,format=I420",
-	// 	"!", "x264enc",
-	// 	"tune=zerolatency",
-	// 	"speed-preset=slow",
-	// 	"crf=16",
-	// 	"key-int-max=60",
-	// 	"!", "matroskamux",
-	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
-	// )
-	// cmd := exec.Command(
-	// 	"gst-launch-1.0",
-	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
-	// 	"!", "videoconvert",
-	// 	"!", "videoscale",
-	// 	"!", "video/x-raw,width=1920,height=1080,framerate=30/1,format=NV12",
-	// 	"!", "nvh264enc",
-	// 	"preset=slow",
-	// 	"rc-mode=vbr",
-	// 	"bitrate=10000",
-	// 	"max-bitrate=20000",
-	// 	"gop-size=60",
-	// 	"!", "h264parse",
-	// 	"!", "matroskamux",
-	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
-	// )
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	return cmd, nil
+}
+
+func startRecording_(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
+	file := os.NewFile(uintptr(pwFd), "pipewire")
+
+	if !strings.HasSuffix(output, ".mkv") {
+		output = output + ".mkv"
+	}
 
 	cmd := exec.Command(
 		"gst-launch-1.0",
 		"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
 		"!", "videoconvert",
-		"!", "videoscale",
-		"!", "video/x-raw,framerate=30/1",
-		"!", "nvh264enc",
-		"preset=lossless",
-		"rc-mode=vbr",
-		"bitrate=20000",
-		"gop-size=60",
-		"!",
-		"h264parse",
-		"config-interval=-1",
-		"!",
-		"matroskamux",
-		"!",
-		"filesink",
-		fmt.Sprintf("location=%s", output),
+		"!", "x264enc", "bitrate=5000", "speed-preset=ultrafast", "key-int-max=30",
+		"!", "matroskamux",
+		"!", "filesink", fmt.Sprintf("location=%s", output),
 	)
 
 	cmd.ExtraFiles = []*os.File{file}
@@ -522,16 +489,16 @@ func main() {
 	fmt.Println("\nPlay it with: ffplay output.mkv")
 }
 
-
-
 func CheckDependencies() error {
 	var errs []string
+	var missingPackages []string
 
 	// ─── Helper functions ───────────────────────────────────────────────
 
-	checkBinary := func(name string) {
+	checkBinary := func(name string, pkg string) {
 		if _, err := exec.LookPath(name); err != nil {
 			errs = append(errs, fmt.Sprintf("missing binary: %s", name))
+			missingPackages = append(missingPackages, pkg)
 		}
 	}
 
@@ -552,10 +519,11 @@ func CheckDependencies() error {
 	// 	}
 	// }
 
-	checkGstPlugin := func(plugin string) {
+	checkGstPlugin := func(plugin, pkg string) {
 		cmd := exec.Command("gst-inspect-1.0", plugin)
 		if err := cmd.Run(); err != nil {
 			errs = append(errs, fmt.Sprintf("missing GStreamer plugin: %s", plugin))
+			missingPackages = append(missingPackages, pkg)
 		}
 	}
 
@@ -589,12 +557,12 @@ func CheckDependencies() error {
 	// ─── Checks ─────────────────────────────────────────────────────────
 
 	// 1. Required binaries
-	checkBinary("gst-launch-1.0")
-	checkBinary("gst-inspect-1.0")
+	checkBinary("gst-launch-1.0",  "gstreamer1.0-tools / gstreamer1")
+	checkBinary("gst-inspect-1.0", "gstreamer1.0-tools / gstreamer1")
 
 	// 2. GStreamer plugins
-	checkGstPlugin("pipewiresrc")
-	checkGstPlugin("x264enc")
+	checkGstPlugin("pipewiresrc", "gstreamer1.0-plugins-good / gst-plugins-good")
+	checkGstPlugin("x264enc", "gstreamer1.0-plugins-ugly / gst-plugins-ugly")
 
 	// 3. Environment (Wayland + D-Bus)
 	checkEnv("DBUS_SESSION_BUS_ADDRESS")
@@ -607,8 +575,58 @@ func CheckDependencies() error {
 	// ─── Result ─────────────────────────────────────────────────────────
 
 	if len(errs) > 0 {
-		return fmt.Errorf("dependency check failed:\n - %s", strings.Join(errs, "\n - "))
+		distro := detectDistro()
+		installCmd := generateInstallCommand(distro, missingPackages)
+		
+		return fmt.Errorf(
+			"dependency check failed:\n - %s\n\nTo install on %s:\n  %s",
+			strings.Join(errs, "\n - "),
+			distro,
+			installCmd,
+		)
+		// return fmt.Errorf("dependency check failed:\n - %s", strings.Join(errs, "\n - "))
 	}
 
 	return nil
+}
+
+
+func detectDistro() string {
+	if _, err := os.Stat("/etc/debian_version"); err == nil {
+		return "Debian/Ubuntu"
+	}
+	if _, err := os.Stat("/etc/fedora-release"); err == nil {
+		return "Fedora"
+	}
+	if _, err := os.Stat("/etc/arch-release"); err == nil {
+		return "Arch"
+	}
+	return "your distro"
+}
+
+
+func generateInstallCommand(distro string, pkgs []string) string {
+	// Map generic package names to distro-specific ones
+	debianMap := map[string]string{
+		"gstreamer1.0-tools / gstreamer1": "gstreamer1.0-tools",
+		"gstreamer1.0-plugins-good / gst-plugins-good": "gstreamer1.0-plugins-good",
+		"gstreamer1.0-plugins-ugly / gst-plugins-ugly": "gstreamer1.0-plugins-ugly",
+	}
+	
+	switch distro {
+	case "Debian/Ubuntu":
+		var resolved []string
+		for _, p := range pkgs {
+			if r, ok := debianMap[p]; ok {
+				resolved = append(resolved, r)
+			}
+		}
+		return fmt.Sprintf("sudo apt install %s", strings.Join(resolved, " "))
+	case "Fedora":
+		return fmt.Sprintf("sudo dnf install %s", strings.Join(pkgs, " "))
+	case "Arch":
+		return fmt.Sprintf("sudo pacman -S %s", strings.Join(pkgs, " "))
+	default:
+		return "please install: " + strings.Join(pkgs, ", ")
+	}
 }
