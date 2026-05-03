@@ -326,13 +326,79 @@ func startRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
 		output = output + ".mkv"
 	}
 
+	// cmd := exec.Command(
+	// 	"gst-launch-1.0",
+	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+	// 	"!", "videoconvert",
+	// 	"!", "x264enc", "bitrate=5000", "speed-preset=ultrafast", "key-int-max=30",
+	// 	"!", "matroskamux",
+	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
+	// )
+
+	// cmd := exec.Command(
+	// 	"gst-launch-1.0",
+	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+	// 	"!", "videoconvert",
+	// 	"!", "video/x-raw,framerate=30/1",
+	// 	"!", "x264enc",
+	// 	"tune=zerolatency",
+	// 	"speed-preset=veryfast",
+	// 	"crf=18",
+	// 	"key-int-max=60",
+	// 	"!", "matroskamux",
+	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
+	// )
+
+	// cmd := exec.Command(
+	// 	"gst-launch-1.0",
+	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+	// 	"!", "videoconvert",
+	// 	"!", "videoscale",
+	// 	"!", "video/x-raw,width=1920,height=1080,framerate=30/1,format=I420",
+	// 	"!", "x264enc",
+	// 	"tune=zerolatency",
+	// 	"speed-preset=slow",
+	// 	"crf=16",
+	// 	"key-int-max=60",
+	// 	"!", "matroskamux",
+	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
+	// )
+	// cmd := exec.Command(
+	// 	"gst-launch-1.0",
+	// 	"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+	// 	"!", "videoconvert",
+	// 	"!", "videoscale",
+	// 	"!", "video/x-raw,width=1920,height=1080,framerate=30/1,format=NV12",
+	// 	"!", "nvh264enc",
+	// 	"preset=slow",
+	// 	"rc-mode=vbr",
+	// 	"bitrate=10000",
+	// 	"max-bitrate=20000",
+	// 	"gop-size=60",
+	// 	"!", "h264parse",
+	// 	"!", "matroskamux",
+	// 	"!", "filesink", fmt.Sprintf("location=%s", output),
+	// )
+
 	cmd := exec.Command(
 		"gst-launch-1.0",
 		"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
 		"!", "videoconvert",
-		"!", "x264enc", "bitrate=5000", "speed-preset=ultrafast", "key-int-max=30",
-		"!", "matroskamux",
-		"!", "filesink", fmt.Sprintf("location=%s", output),
+		"!", "videoscale",
+		"!", "video/x-raw,framerate=30/1",
+		"!", "nvh264enc",
+		"preset=lossless",
+		"rc-mode=vbr",
+		"bitrate=20000",
+		"gop-size=60",
+		"!",
+		"h264parse",
+		"config-interval=-1",
+		"!",
+		"matroskamux",
+		"!",
+		"filesink",
+		fmt.Sprintf("location=%s", output),
 	)
 
 	cmd.ExtraFiles = []*os.File{file}
@@ -349,6 +415,9 @@ func startRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
 // ─── Main ─────────────────────────────────────────────────────────────────
 
 func main() {
+	if err := CheckDependencies(); err != nil {
+		log.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -451,4 +520,95 @@ func main() {
 
 	fmt.Println("✅ Recording saved to output.mkv")
 	fmt.Println("\nPlay it with: ffplay output.mkv")
+}
+
+
+
+func CheckDependencies() error {
+	var errs []string
+
+	// ─── Helper functions ───────────────────────────────────────────────
+
+	checkBinary := func(name string) {
+		if _, err := exec.LookPath(name); err != nil {
+			errs = append(errs, fmt.Sprintf("missing binary: %s", name))
+		}
+	}
+
+	checkEnv := func(key string) {
+		if os.Getenv(key) == "" {
+			errs = append(errs, fmt.Sprintf("missing environment variable: %s", key))
+		}
+	}
+
+	// checkEnvEquals := func(key, expected string) {
+	// 	val := os.Getenv(key)
+	// 	if val == "" {
+	// 		errs = append(errs, fmt.Sprintf("missing environment variable: %s", key))
+	// 		return
+	// 	}
+	// 	if val != expected {
+	// 		errs = append(errs, fmt.Sprintf("%s must be '%s' (got '%s')", key, expected, val))
+	// 	}
+	// }
+
+	checkGstPlugin := func(plugin string) {
+		cmd := exec.Command("gst-inspect-1.0", plugin)
+		if err := cmd.Run(); err != nil {
+			errs = append(errs, fmt.Sprintf("missing GStreamer plugin: %s", plugin))
+		}
+	}
+
+	checkDBusName := func(name string) {
+		conn, err := dbus.SessionBus()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("failed to connect to D-Bus: %v", err))
+			return
+		}
+		defer conn.Close()
+
+		var names []string
+		err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("failed to list D-Bus names: %v", err))
+			return
+		}
+
+		found := false
+		for _, n := range names {
+			if n == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fmt.Sprintf("D-Bus service not available: %s", name))
+		}
+	}
+
+	// ─── Checks ─────────────────────────────────────────────────────────
+
+	// 1. Required binaries
+	checkBinary("gst-launch-1.0")
+	checkBinary("gst-inspect-1.0")
+
+	// 2. GStreamer plugins
+	checkGstPlugin("pipewiresrc")
+	checkGstPlugin("x264enc")
+
+	// 3. Environment (Wayland + D-Bus)
+	checkEnv("DBUS_SESSION_BUS_ADDRESS")
+	// checkEnv("WAYLAND_DISPLAY")
+	// checkEnvEquals("XDG_SESSION_TYPE", "wayland")
+
+	// 4. D-Bus portal availability
+	checkDBusName("org.freedesktop.portal.Desktop")
+
+	// ─── Result ─────────────────────────────────────────────────────────
+
+	if len(errs) > 0 {
+		return fmt.Errorf("dependency check failed:\n - %s", strings.Join(errs, "\n - "))
+	}
+
+	return nil
 }
