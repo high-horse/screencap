@@ -1,0 +1,451 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+	// "github.com/pipewire/pipewire-go"
+)
+
+const portalBusName = "org.freedesktop.portal.Desktop"
+const portalObjectPath = "/org/freedesktop/portal/desktop"
+const portalInterface = "org.freedesktop.portal.ScreenCast"
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle Ctrl+C
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		<-sigCh
+		fmt.Println("\nShutting down...")
+		cancel()
+	}()
+
+	// Connect to D-Bus
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		log.Fatal("Failed to connect to session bus:", err)
+	}
+
+	// Check available source types
+	sources, err := getAvailableSourceTypes(conn)
+	if err != nil {
+		fmt.Printf("Warning: Could not get available source types: %v\n", err)
+	} else {
+		fmt.Printf("Available source types: %d (1=Monitor, 2=Window, 4=Virtual)\n", sources)
+	}
+
+	// Create session
+	sessionPath, err := createSession(conn)
+	if err != nil {
+		log.Fatal("Failed to create session:", err)
+	}
+	fmt.Println("✓ Session created:", sessionPath)
+
+	// Select sources
+	if err := selectSources(conn, sessionPath); err != nil {
+		log.Fatal("Failed to select sources:", err)
+	}
+	fmt.Println("✓ Sources selected")
+
+	// Start session (this shows the dialog)
+	nodeID, streamProps, err := startSession(conn, sessionPath)
+	if err != nil {
+		log.Fatal("Failed to start session:", err)
+	}
+	fmt.Printf("✓ Screen sharing started!\n")
+	fmt.Printf("  PipeWire Node ID: %d\n", nodeID)
+	
+	// Print stream properties
+	var streamWidth, streamHeight uint32
+	if size, ok := streamProps["size"]; ok {
+		if sizeValue, ok := size.Value().(struct {
+			Width  uint32
+			Height uint32
+		}); ok {
+			streamWidth = sizeValue.Width
+			streamHeight = sizeValue.Height
+			fmt.Printf("  Stream size: %dx%d\n", streamWidth, streamHeight)
+		}
+	}
+	if sourceType, ok := streamProps["source_type"]; ok {
+		fmt.Printf("  Source type: %d (1=Monitor, 2=Window, 4=Virtual)\n", sourceType.Value())
+	}
+
+	// Open PipeWire remote
+	pwFd, err := openPipeWireRemote(conn, sessionPath)
+	if err != nil {
+		log.Fatal("Failed to open PipeWire remote:", err)
+	}
+	fmt.Printf("✓ PipeWire remote FD: %d\n", pwFd)
+
+	// Initialize PipeWire
+	pw.Init()
+	defer pw.Deinit()
+
+	// Create PipeWire main loop
+	mainLoop := pw.Loop.NewMainLoop()
+	context := pw.NewContext(nil)
+	core, err := context.Connect()
+	if err != nil {
+		log.Fatal("Failed to connect to PipeWire:", err)
+	}
+
+	// Create recording session with timestamp
+	filename := fmt.Sprintf("screen_recording_%s.mp4", time.Now().Format("20060102_150405"))
+	
+	// Create GStreamer pipeline
+	gstPipeline, err := createGStreamerPipeline(filename, streamWidth, streamHeight)
+	if err != nil {
+		log.Fatal("Failed to create GStreamer pipeline:", err)
+	}
+	defer gstPipeline.Stop()
+
+	fmt.Printf("\n📹 Recording to: %s\n", filename)
+	fmt.Println("Press Ctrl+C to stop recording...")
+
+	// Monitor the recording
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				gstPipeline.Stop()
+				fmt.Printf("\n✓ Recording saved to: %s\n", filename)
+				mainLoop.Quit()
+				return
+			default:
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Run main loop
+	mainLoop.Run()
+	
+	fmt.Println("Screen sharing stopped.")
+}
+
+type GStreamerPipeline struct {
+	pipeline *gst.Pipeline
+}
+
+func createGStreamerPipeline(filename string, width, height uint32) (*GStreamerPipeline, error) {
+	// Initialize GStreamer
+	gst.Init(nil)
+	
+	// Build pipeline
+	// This pipeline captures from PipeWire, encodes to H.264, and saves to MP4
+	pipelineStr := fmt.Sprintf(
+		"pipewiresrc path=%d ! "+
+		"video/x-raw,format=BGRx,width=%d,height=%d ! "+
+		"videoconvert ! "+
+		"video/x-raw,format=I420 ! "+
+		"x264enc speed-preset=ultrafast tune=zerolatency ! "+
+		"mp4mux ! "+
+		"filesink location=%s",
+		nodeID, width, height, filename)
+	
+	pipeline, err := gst.NewPipeline(pipelineStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pipeline: %v", err)
+	}
+	
+	// Start pipeline
+	bus := pipeline.GetBus()
+	pipeline.SetState(gst.StatePlaying)
+	
+	// Monitor for errors
+	go func() {
+		msg := bus.TimedPopFiltered(gst.CLOCK_TIME_NONE, gst.MESSAGE_ERROR|gst.MESSAGE_EOS)
+		if msg != nil {
+			switch msg.Type() {
+			case gst.MESSAGE_ERROR:
+				err := msg.ParseError()
+				log.Printf("GStreamer error: %v", err)
+			case gst.MESSAGE_EOS:
+				fmt.Println("Recording finished")
+			}
+		}
+	}()
+	
+	return &GStreamerPipeline{pipeline: pipeline}, nil
+}
+
+func (g *GStreamerPipeline) Stop() {
+	if g.pipeline != nil {
+		g.pipeline.SetState(gst.StateNull)
+		g.pipeline.Unref()
+	}
+}
+
+func getAvailableSourceTypes(conn *dbus.Conn) (uint32, error) {
+	obj := conn.Object(portalBusName, portalObjectPath)
+	var sources uint32
+	err := obj.Call("org.freedesktop.DBus.Properties.Get", 0, portalInterface, "AvailableSourceTypes").Store(&sources)
+	if err != nil {
+		return 0, err
+	}
+	return sources, nil
+}
+
+func createSession(conn *dbus.Conn) (dbus.ObjectPath, error) {
+	requestToken := fmt.Sprintf("req%d", time.Now().UnixNano())
+	sessionToken := fmt.Sprintf("sess%d", time.Now().UnixNano())
+	
+	sender := strings.ReplaceAll(conn.Names()[0], ":", "_")
+	sender = strings.ReplaceAll(sender, ".", "_")
+	requestPath := dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/portal/desktop/request/%s/%s", sender, requestToken))
+	
+	matchRule := fmt.Sprintf("type='signal',interface='org.freedesktop.portal.Request',member='Response',path='%s'", requestPath)
+	if err := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchRule).Err; err != nil {
+		return "", fmt.Errorf("failed to add match: %v", err)
+	}
+	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+	
+	signalCh := make(chan *dbus.Signal, 1)
+	conn.Signal(signalCh)
+	defer conn.Signal(nil)
+	
+	obj := conn.Object(portalBusName, portalObjectPath)
+	call := obj.Call(portalInterface+".CreateSession", 0, map[string]interface{}{
+		"session_handle_token": sessionToken,
+		"handle_token":         requestToken,
+	})
+	if call.Err != nil {
+		return "", fmt.Errorf("CreateSession call failed: %v", call.Err)
+	}
+	
+	timeout := time.After(30 * time.Second)
+	for {
+		select {
+		case sig := <-signalCh:
+			if sig.Name == "org.freedesktop.portal.Request.Response" {
+				response := sig.Body[0].(uint32)
+				if response != 0 {
+					return "", fmt.Errorf("session creation failed with code %d", response)
+				}
+				results := sig.Body[1].(map[string]dbus.Variant)
+				sessionHandleStr, ok := results["session_handle"].Value().(string)
+				if !ok {
+					return "", fmt.Errorf("session_handle is not a string")
+				}
+				return dbus.ObjectPath(sessionHandleStr), nil
+			}
+		case <-timeout:
+			return "", fmt.Errorf("timeout waiting for session creation")
+		}
+	}
+}
+
+func selectSources(conn *dbus.Conn, sessionPath dbus.ObjectPath) error {
+	requestToken := fmt.Sprintf("req%d", time.Now().UnixNano())
+	
+	sender := strings.ReplaceAll(conn.Names()[0], ":", "_")
+	sender = strings.ReplaceAll(sender, ".", "_")
+	requestPath := dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/portal/desktop/request/%s/%s", sender, requestToken))
+	
+	matchRule := fmt.Sprintf("type='signal',interface='org.freedesktop.portal.Request',member='Response',path='%s'", requestPath)
+	if err := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchRule).Err; err != nil {
+		return fmt.Errorf("failed to add match: %v", err)
+	}
+	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+	
+	signalCh := make(chan *dbus.Signal, 1)
+	conn.Signal(signalCh)
+	defer conn.Signal(nil)
+	
+	obj := conn.Object(portalBusName, portalObjectPath)
+	
+	call := obj.Call(portalInterface+".SelectSources", 0, sessionPath, map[string]interface{}{
+		"handle_token": requestToken,
+		"types":        uint32(1 | 2),
+		"multiple":     false,
+		"cursor_mode":  uint32(2),
+	})
+	if call.Err != nil {
+		return fmt.Errorf("SelectSources call failed: %v", call.Err)
+	}
+	
+	timeout := time.After(30 * time.Second)
+	for {
+		select {
+		case sig := <-signalCh:
+			if sig.Name == "org.freedesktop.portal.Request.Response" {
+				response := sig.Body[0].(uint32)
+				if response != 0 {
+					return fmt.Errorf("source selection failed with code %d", response)
+				}
+				return nil
+			}
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for source selection")
+		}
+	}
+}
+
+func startSession(conn *dbus.Conn, sessionPath dbus.ObjectPath) (uint32, map[string]dbus.Variant, error) {
+	requestToken := fmt.Sprintf("req%d", time.Now().UnixNano())
+	
+	sender := strings.ReplaceAll(conn.Names()[0], ":", "_")
+	sender = strings.ReplaceAll(sender, ".", "_")
+	requestPath := dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/portal/desktop/request/%s/%s", sender, requestToken))
+	
+	matchRule := fmt.Sprintf("type='signal',interface='org.freedesktop.portal.Request',member='Response',path='%s'", requestPath)
+	if err := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchRule).Err; err != nil {
+		return 0, nil, fmt.Errorf("failed to add match: %v", err)
+	}
+	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+	
+	signalCh := make(chan *dbus.Signal, 1)
+	conn.Signal(signalCh)
+	defer conn.Signal(nil)
+	
+	obj := conn.Object(portalBusName, portalObjectPath)
+	parentWindow := ""
+	
+	fmt.Println("  Opening GNOME screen sharing dialog...")
+	fmt.Println("  Please select a monitor or window to share.")
+	
+	call := obj.Call(portalInterface+".Start", 0, sessionPath, parentWindow, map[string]interface{}{
+		"handle_token": requestToken,
+	})
+	if call.Err != nil {
+		return 0, nil, fmt.Errorf("Start call failed: %v", call.Err)
+	}
+	
+	timeout := time.After(60 * time.Second)
+	for {
+		select {
+		case sig := <-signalCh:
+			if sig.Name == "org.freedesktop.portal.Request.Response" {
+				response := sig.Body[0].(uint32)
+				if response != 0 {
+					return 0, nil, fmt.Errorf("start failed with code %d", response)
+				}
+				
+				if len(sig.Body) < 2 {
+					return 0, nil, fmt.Errorf("no results in response")
+				}
+				
+				results, ok := sig.Body[1].(map[string]dbus.Variant)
+				if !ok {
+					return 0, nil, fmt.Errorf("results is not a map, got %T", sig.Body[1])
+				}
+				
+				streamsValue, hasStreams := results["streams"]
+				if !hasStreams {
+					return 0, nil, fmt.Errorf("no 'streams' key in results")
+				}
+				
+				streamsData := streamsValue.Value()
+				
+				var nodeID uint32
+				var streamProps map[string]dbus.Variant
+				
+				switch v := streamsData.(type) {
+				case []interface{}:
+					if len(v) == 0 {
+						return 0, nil, fmt.Errorf("no streams returned - user probably cancelled")
+					}
+					
+					if firstStream, ok := v[0].([]interface{}); ok {
+						if len(firstStream) < 2 {
+							return 0, nil, fmt.Errorf("stream tuple has %d elements", len(firstStream))
+						}
+						
+						switch id := firstStream[0].(type) {
+						case uint32:
+							nodeID = id
+						case int:
+							nodeID = uint32(id)
+						case int32:
+							nodeID = uint32(id)
+						default:
+							return 0, nil, fmt.Errorf("node ID is not uint32, got %T", firstStream[0])
+						}
+						
+						if props, ok := firstStream[1].(map[string]dbus.Variant); ok {
+							streamProps = props
+						} else {
+							return 0, nil, fmt.Errorf("stream properties is not map, got %T", firstStream[1])
+						}
+					} else {
+						if len(v) < 2 {
+							return 0, nil, fmt.Errorf("stream tuple has %d elements", len(v))
+						}
+						
+						switch id := v[0].(type) {
+						case uint32:
+							nodeID = id
+						case int:
+							nodeID = uint32(id)
+						case int32:
+							nodeID = uint32(id)
+						default:
+							return 0, nil, fmt.Errorf("node ID is not uint32, got %T", v[0])
+						}
+						
+						if props, ok := v[1].(map[string]dbus.Variant); ok {
+							streamProps = props
+						} else {
+							return 0, nil, fmt.Errorf("stream properties is not map, got %T", v[1])
+						}
+					}
+					
+				case [][]interface{}:
+					if len(v) == 0 {
+						return 0, nil, fmt.Errorf("no streams returned - user probably cancelled")
+					}
+					
+					firstStream := v[0]
+					if len(firstStream) < 2 {
+						return 0, nil, fmt.Errorf("stream tuple has %d elements", len(firstStream))
+					}
+					
+					switch id := firstStream[0].(type) {
+					case uint32:
+						nodeID = id
+					case int:
+						nodeID = uint32(id)
+					case int32:
+						nodeID = uint32(id)
+					default:
+						return 0, nil, fmt.Errorf("node ID is not uint32, got %T", firstStream[0])
+					}
+					
+					if props, ok := firstStream[1].(map[string]dbus.Variant); ok {
+						streamProps = props
+					} else {
+						return 0, nil, fmt.Errorf("stream properties is not map, got %T", firstStream[1])
+					}
+					
+				default:
+					return 0, nil, fmt.Errorf("unexpected streams data type: %T", streamsData)
+				}
+				
+				return nodeID, streamProps, nil
+			}
+		case <-timeout:
+			return 0, nil, fmt.Errorf("timeout waiting for user to select sources")
+		}
+	}
+}
+
+func openPipeWireRemote(conn *dbus.Conn, sessionPath dbus.ObjectPath) (int, error) {
+	obj := conn.Object(portalBusName, portalObjectPath)
+	var fd dbus.UnixFD
+	err := obj.Call(portalInterface+".OpenPipeWireRemote", 0, sessionPath, map[string]interface{}{}).Store(&fd)
+	if err != nil {
+		return -1, fmt.Errorf("OpenPipeWireRemote failed: %v", err)
+	}
+	return int(fd), nil
+}
