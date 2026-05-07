@@ -3,6 +3,7 @@ package dbusutil
 import (
 	"fmt"
 	"screencap/config"
+	portalerrors "screencap/internal/errors"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -25,7 +26,7 @@ func WaitResponse(
 
 	deadline := time.After(timeout)
 
-	response := &PortalResponse{} 
+	response := &PortalResponse{}
 	for {
 		select {
 
@@ -43,18 +44,18 @@ func WaitResponse(
 			}
 
 			if sig.Body == nil || len(sig.Body) < 2 {
-				return nil, fmt.Errorf("invalid portal response")
+				return nil, portalerrors.ErrInvalidResponse
 			}
 
 			if len(sig.Body) < 2 {
-				return nil, fmt.Errorf("invalid portal response")
+				return nil, portalerrors.ErrInvalidResponse
 			}
 
 			code, ok := sig.Body[0].(uint32)
 			if !ok {
 				return nil, fmt.Errorf("invalid response code type")
 			}
-			response.Code = code			
+			response.Code = code
 
 			if response.Code != 0 {
 				return response, fmt.Errorf("portal error code %d", response.Code)
@@ -69,7 +70,7 @@ func WaitResponse(
 			return response, nil
 
 		case <-deadline:
-			return nil, fmt.Errorf("timeout waiting for portal response")
+			return nil, portalerrors.ErrTimeout
 		}
 	}
 }

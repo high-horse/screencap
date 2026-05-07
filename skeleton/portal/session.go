@@ -5,25 +5,25 @@ import (
 	"log"
 	"screencap/config"
 	"screencap/dbusutil"
-	"time"
+	"screencap/internal/util"
 
 	"github.com/godbus/dbus/v5"
 )
 
 // CreateSession creates a new screen cast session and returns its path.
 func (p *ScreenCastPortal) CreateSession() (dbus.ObjectPath, error) {
-	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
-	sessToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	reqToken := util.NewTOken()
+	sessToken := util.NewTOken()
 
 	reqPath := p.requestPath(reqToken)
 
 	// CRITICAL: AddMatch must include sender='org.freedesktop.portal.Desktop'
 	rule, err := dbusutil.AddMatch(p.conn, reqPath)
-	if(err != nil){
+	if err != nil {
 		log.Println("DBUS addmatch error ", err)
 	}
 	defer dbusutil.RemoveMatch(p.conn, rule)
-	
+
 	// Setup signal channel BEFORE making the call
 	signalCh := make(chan *dbus.Signal, 10)
 	p.conn.Signal(signalCh)
@@ -42,19 +42,19 @@ func (p *ScreenCastPortal) CreateSession() (dbus.ObjectPath, error) {
 	// Debug: print the returned handle
 	fmt.Printf("DEBUG: CreateSession returned handle: %v\n", call.Body)
 
-	resp , err := dbusutil.WaitResponse(p.conn, reqPath, time.Second * 30)
+	resp, err := dbusutil.WaitResponse(p.conn, reqPath, config.DefaultTImeout)
 	if err != nil {
 		return "", err
 	}
 
 	sessionHandle := resp.Results["session_handle"].Value().(string)
 	return dbus.ObjectPath(sessionHandle), nil
-	
+
 }
 
 // SelectSources configures what to capture (monitors, windows, cursor).
 func (p *ScreenCastPortal) SelectSources(sessionPath dbus.ObjectPath) error {
-	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	reqToken := util.NewTOken()
 	reqPath := p.requestPath(reqToken)
 
 	rule, err := dbusutil.AddMatch(p.conn, reqPath)
@@ -78,19 +78,18 @@ func (p *ScreenCastPortal) SelectSources(sessionPath dbus.ObjectPath) error {
 		return fmt.Errorf("SelectSources call failed: %w", call.Err)
 	}
 
-	_ , err = dbusutil.WaitResponse(p.conn, reqPath, time.Second * 30)
+	_, err = dbusutil.WaitResponse(p.conn, reqPath, config.DefaultTImeout)
 	if err != nil {
-		return  err
+		return err
 	}
 	return nil
-	
-	
+
 }
 
 // Start triggers the GUI dialog for user to pick a screen/window.
 // Returns the PipeWire node ID and stream properties.
 func (p *ScreenCastPortal) Start(sessionPath dbus.ObjectPath) (uint32, map[string]dbus.Variant, error) {
-	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	reqToken := util.NewTOken()
 	reqPath := p.requestPath(reqToken)
 
 	rule, err := dbusutil.AddMatch(p.conn, reqPath)
@@ -114,12 +113,12 @@ func (p *ScreenCastPortal) Start(sessionPath dbus.ObjectPath) (uint32, map[strin
 		return 0, nil, fmt.Errorf("Start call failed: %w", call.Err)
 	}
 
-	resp, err := dbusutil.WaitResponse(p.conn, reqPath, time.Second * 60)
+	resp, err := dbusutil.WaitResponse(p.conn, reqPath, config.UserSelectTimeout)
 	if err != nil {
 		return 0, nil, err
 	}
 	streams := resp.Results["streams"]
 	return p.parseStreams(map[string]dbus.Variant{
-			"streams": streams,
+		"streams": streams,
 	})
 }
