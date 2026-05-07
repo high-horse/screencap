@@ -2,60 +2,124 @@ package portal
 
 import (
 	"fmt"
+	"log"
+	"screencap/config"
+	"screencap/dbusutil"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
 
-// Session holds the D-Bus connection and the session handle returned
-// by the portal after CreateSession succeeds.
-type Session struct {
-	Conn   *dbus.Conn
-	Handle dbus.ObjectPath
+// CreateSession creates a new screen cast session and returns its path.
+func (p *ScreenCastPortal) CreateSession() (dbus.ObjectPath, error) {
+	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	sessToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+
+	reqPath := p.requestPath(reqToken)
+
+	// CRITICAL: AddMatch must include sender='org.freedesktop.portal.Desktop'
+	rule, err := dbusutil.AddMatch(p.conn, reqPath)
+	if(err != nil){
+		log.Println("DBUS addmatch error ", err)
+	}
+	defer dbusutil.RemoveMatch(p.conn, rule)
+	
+	// Setup signal channel BEFORE making the call
+	signalCh := make(chan *dbus.Signal, 10)
+	p.conn.Signal(signalCh)
+	defer p.conn.RemoveSignal(signalCh)
+
+	// Make the call
+	obj := p.conn.Object(config.PortalBusName, config.PortalObjectPath)
+	call := obj.Call(config.PortalInterface+".CreateSession", 0, map[string]any{
+		"session_handle_token": sessToken,
+		"handle_token":         reqToken,
+	})
+	if call.Err != nil {
+		return "", fmt.Errorf("CreateSession call failed: %w", call.Err)
+	}
+
+	// Debug: print the returned handle
+	fmt.Printf("DEBUG: CreateSession returned handle: %v\n", call.Body)
+
+	resp , err := dbusutil.WaitResponse(p.conn, reqPath, time.Second * 30)
+	if err != nil {
+		return "", err
+	}
+
+	sessionHandle := resp.Results["session_handle"].Value().(string)
+	return dbus.ObjectPath(sessionHandle), nil
+	
 }
 
-// NewSession connects to the session D-Bus and calls
-// org.freedesktop.portal.ScreenCast.CreateSession.
-func NewSession() (*Session, error) {
-	conn, err := dbus.SessionBus()
+// SelectSources configures what to capture (monitors, windows, cursor).
+func (p *ScreenCastPortal) SelectSources(sessionPath dbus.ObjectPath) error {
+	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	reqPath := p.requestPath(reqToken)
+
+	rule, err := dbusutil.AddMatch(p.conn, reqPath)
 	if err != nil {
-		return nil, fmt.Errorf("connect session bus: %w", err)
+		log.Println("err in addmatch ", err)
+	}
+	defer dbusutil.RemoveMatch(p.conn, rule)
+
+	signalCh := make(chan *dbus.Signal, 10)
+	p.conn.Signal(signalCh)
+	defer p.conn.RemoveSignal(signalCh)
+
+	obj := p.conn.Object(config.PortalBusName, config.PortalObjectPath)
+	call := obj.Call(config.PortalInterface+".SelectSources", 0, sessionPath, map[string]any{
+		"handle_token": reqToken,
+		"types":        uint32(1 | 2), // Monitor + Window
+		"multiple":     false,
+		"cursor_mode":  uint32(2), // Embedded
+	})
+	if call.Err != nil {
+		return fmt.Errorf("SelectSources call failed: %w", call.Err)
 	}
 
-	handleToken   := nextToken()
-	sessionToken  := nextToken()
-
-	obj := conn.Object(portalDest, portalPath)
-
-	var requestPath dbus.ObjectPath
-	err = obj.Call(
-		screencastIface+".CreateSession", 0,
-		map[string]dbus.Variant{
-			"handle_token":         dbus.MakeVariant(handleToken),
-			"session_handle_token": dbus.MakeVariant(sessionToken),
-		},
-	).Store(&requestPath)
+	_ , err = dbusutil.WaitResponse(p.conn, reqPath, time.Second * 30)
 	if err != nil {
-		return nil, fmt.Errorf("CreateSession call: %w", err)
+		return  err
 	}
-
-	resp, err := AwaitResponse(conn, requestPath)
-	if err != nil {
-		return nil, fmt.Errorf("CreateSession response: %w", err)
-	}
-
-	sessionHandle, ok := resp.Results["session_handle"]
-	if !ok {
-		return nil, fmt.Errorf("no session_handle in response")
-	}
-
-	return &Session{
-		Conn:   conn,
-		Handle: dbus.ObjectPath(sessionHandle.Value().(string)),
-	}, nil
+	return nil
+	
+	
 }
 
-// Close sends Close on the session object so the compositor tears it down.
-func (s *Session) Close() error {
-	obj := s.Conn.Object(portalDest, s.Handle)
-	return obj.Call("org.freedesktop.portal.Session.Close", 0).Err
+// Start triggers the GUI dialog for user to pick a screen/window.
+// Returns the PipeWire node ID and stream properties.
+func (p *ScreenCastPortal) Start(sessionPath dbus.ObjectPath) (uint32, map[string]dbus.Variant, error) {
+	reqToken := fmt.Sprintf("u%d", time.Now().UnixNano())
+	reqPath := p.requestPath(reqToken)
+
+	rule, err := dbusutil.AddMatch(p.conn, reqPath)
+	if err != nil {
+		log.Println("Error in addmatch ", err)
+	}
+	defer dbusutil.RemoveMatch(p.conn, rule)
+
+	signalCh := make(chan *dbus.Signal, 10)
+	p.conn.Signal(signalCh)
+	defer p.conn.RemoveSignal(signalCh)
+
+	fmt.Println("  Opening screen sharing dialog...")
+	fmt.Println("  Please select a monitor or window to share.")
+
+	obj := p.conn.Object(config.PortalBusName, config.PortalObjectPath)
+	call := obj.Call(config.PortalInterface+".Start", 0, sessionPath, "", map[string]any{
+		"handle_token": reqToken,
+	})
+	if call.Err != nil {
+		return 0, nil, fmt.Errorf("Start call failed: %w", call.Err)
+	}
+
+	resp, err := dbusutil.WaitResponse(p.conn, reqPath, time.Second * 60)
+	if err != nil {
+		return 0, nil, err
+	}
+	streams := resp.Results["streams"]
+	return p.parseStreams(map[string]dbus.Variant{
+			"streams": streams,
+	})
 }
