@@ -1,3 +1,4 @@
+// session.go
 package portal
 
 import (
@@ -34,6 +35,7 @@ func (p *ScreenCastPortal) CreateSession() (dbus.ObjectPath, error) {
 	call := obj.Call(config.PortalInterface+".CreateSession", 0, map[string]any{
 		"session_handle_token": sessToken,
 		"handle_token":         reqToken,
+		"persist_mode":         uint32(2),
 	})
 	if call.Err != nil {
 		return "", fmt.Errorf("CreateSession call failed: %w", call.Err)
@@ -73,6 +75,7 @@ func (p *ScreenCastPortal) SelectSources(sessionPath dbus.ObjectPath) error {
 		"types":        uint32(1 | 2), // Monitor + Window
 		"multiple":     false,
 		"cursor_mode":  uint32(2), // Embedded
+		"persist_mode": uint32(2),
 	})
 	if call.Err != nil {
 		return fmt.Errorf("SelectSources call failed: %w", call.Err)
@@ -122,7 +125,6 @@ func (p *ScreenCastPortal) Start(sessionPath dbus.ObjectPath) (uint32, map[strin
 		"streams": streams,
 	})
 }
-
 
 func (p *ScreenCastPortal) Capture() (*CaptureSession, error) {
 
