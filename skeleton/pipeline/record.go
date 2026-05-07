@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"screencap/portal"
 	"strings"
 )
 
 // ─── Recording ────────────────────────────────────────────────────────────
-func StartRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
-	file := os.NewFile(uintptr(pwFd), "pipewire")
+// // pwFd int, nodeID uint32
+func StartRecording(session *portal.CaptureSession, output string) (*exec.Cmd, error) {
+	file := os.NewFile(uintptr(session.PipeWireFD), "pipewire")
 
 	if !strings.HasSuffix(output, ".mkv") {
 		output = output + ".mkv"
@@ -17,7 +19,7 @@ func StartRecording(pwFd int, nodeID uint32, output string) (*exec.Cmd, error) {
 
 	cmd := exec.Command(
 		"gst-launch-1.0",
-		"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID),
+		"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", session.NodeID),
 		"!", "videoconvert",
 		"!", "videoscale", "!", "video/x-raw, format=I420", // ensure proper colorspace
 		"!", "x264enc",

@@ -122,3 +122,37 @@ func (p *ScreenCastPortal) Start(sessionPath dbus.ObjectPath) (uint32, map[strin
 		"streams": streams,
 	})
 }
+
+
+func (p *ScreenCastPortal) Capture() (*CaptureSession, error) {
+
+	// 1. Create portal session
+	sessionPath, err := p.CreateSession()
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Ask user to select monitor/window
+	if err := p.SelectSources(sessionPath); err != nil {
+		return nil, err
+	}
+
+	// 3. Start stream
+	nodeID, props, err := p.Start(sessionPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. Open PipeWire remote
+	pwFD, err := p.OpenPipeWireRemote(sessionPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CaptureSession{
+		SessionPath: sessionPath,
+		NodeID:      nodeID,
+		PipeWireFD:  pwFD,
+		Props:       props,
+	}, nil
+}

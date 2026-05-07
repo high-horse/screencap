@@ -44,30 +44,12 @@ func main() {
 		fmt.Printf("Available source types: %d (1=Monitor, 2=Window, 4=Virtual)\n", sources)
 	}
 
-	sessionPath, err := portal.CreateSession()
+	sess, err := portal.Capture()
 	if err != nil {
-		log.Fatal("Failed to create session:", err)
+		log.Fatal(err)
 	}
 
-	if err := portal.SelectSources(sessionPath); err != nil {
-		log.Fatal("Failed to select sources:", err)
-	}
-
-	nodeId, streamProps, err := portal.Start(sessionPath)
-	if err != nil {
-		log.Fatal("Failed to start session:", err)
-	}
-
-	if size, ok := streamProps["size"]; ok {
-		fmt.Printf("  Stream size: %+v\n", size.Value())
-	}
-
-	pwFd, err := portal.OpenPipeWireRemote(sessionPath)
-	if err != nil {
-		fmt.Println("COuld not open pipewire remote ", err)
-	}
-
-	recCmd, err := pipeline.StartRecording(pwFd, nodeId, "recording")
+	recCmd, err := pipeline.StartRecording(sess, "recording")
 	if err != nil {
 		log.Fatal(err)
 	}
