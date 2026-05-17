@@ -164,3 +164,179 @@ func StartRecording(session *portal.CaptureSession, output string) (*Recorder, e
 	}
 	return &Recorder{cmd: cmd}, nil
 }
+
+
+// working fine implementation
+func StartStream(session *portal.CaptureSession) (*Recorder, error) {
+	file := os.NewFile(uintptr(session.PipeWireFD), "pipewire")
+
+	cmd := exec.Command(
+		"gst-launch-1.0",
+
+		// Source
+		"pipewiresrc",
+		"fd=3",
+		fmt.Sprintf("path=%d", session.NodeID),
+
+		"do-timestamp=true",
+
+		// Prevent queue buildup
+		"!",
+		"queue",
+		"leaky=downstream",
+		"max-size-buffers=2",
+
+		// Convert
+		"!",
+		"videoconvert",
+
+		// NVENC expects NV12
+		"!",
+		"video/x-raw,format=NV12",
+
+		// Encoder
+		"!",
+		"nvh264enc",
+
+		"bitrate=6000",
+		"preset=1",
+		"bframes=0",
+		"gop-size=30",
+
+		// Parse
+		"!",
+		"h264parse",
+
+		"config-interval=1",
+
+		// MPEGTS mux
+		"!",
+		"mpegtsmux",
+
+		"alignment=7",
+
+		// UDP stream
+		"!",
+		"udpsink",
+
+		"host=127.0.0.1",
+		"port=5000",
+
+		"sync=false",
+		"async=false",
+	)
+
+	cmd.ExtraFiles = []*os.File{file}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	fmt.Println("UDP MPEG-TS stream ready")
+	fmt.Println("")
+	fmt.Println("Open with VLC:")
+	fmt.Println("vlc udp://@:5000")
+	fmt.Println("")
+	fmt.Println("Open with ffplay:")
+	fmt.Println("ffplay -fflags nobuffer -flags low_delay udp://127.0.0.1:5000")
+
+	return &Recorder{
+		cmd: cmd,
+	}, nil
+}
+
+
+// does nnot works properly.
+func StartStream_bkp(session *portal.CaptureSession) (*Recorder, error) {
+	file := os.NewFile(uintptr(session.PipeWireFD), "pipewire")
+
+	cmd := exec.Command(
+		"gst-launch-1.0",
+
+		// Source
+		"pipewiresrc",
+		"fd=3",
+		fmt.Sprintf("path=%d", session.NodeID),
+		"do-timestamp=true",
+
+		// Prevent latency buildup
+		"!",
+		"queue",
+		"leaky=downstream",
+		"max-size-buffers=2",
+
+		// Convert
+		"!",
+		"videoconvert",
+
+		// x264 wants I420
+		"!",
+		"video/x-raw,format=I420",
+
+		// Encoder
+		"!",
+		"x264enc",
+
+		// ultra low latency
+		"tune=zerolatency",
+
+		// fastest encoding
+		"speed-preset=ultrafast",
+
+		// bitrate kbps
+		"bitrate=4000",
+
+		// keyframe every second
+		"key-int-max=30",
+
+		// no bframes
+		"bframes=0",
+
+		// H264 parser
+		"!",
+		"h264parse",
+
+		// resend codec config
+		"config-interval=1",
+
+		// MPEGTS mux
+		"!",
+		"mpegtsmux",
+
+		"alignment=7",
+
+		// UDP output
+		"!",
+		"udpsink",
+
+		"host=127.0.0.1",
+		"port=5000",
+
+		"sync=false",
+		"async=false",
+	)
+
+	cmd.ExtraFiles = []*os.File{file}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	fmt.Println("Stream ready")
+	fmt.Println("")
+	fmt.Println("VLC:")
+	fmt.Println("vlc udp://@:5000")
+	fmt.Println("")
+	fmt.Println("ffplay:")
+	fmt.Println("ffplay -fflags nobuffer -flags low_delay udp://127.0.0.1:5000")
+
+	return &Recorder{
+		cmd: cmd,
+	}, nil
+}

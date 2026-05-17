@@ -37,10 +37,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rec, err := pipeline.StartRecording(sess, "recording")
+	rec, err := pipeline.StartStream(sess)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err);
 	}
+
+	// rec, err := pipeline.StartRecording(sess, "recording")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
 
 	<-ctx.Done()
 
